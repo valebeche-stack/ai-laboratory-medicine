@@ -1,2 +1,11 @@
-pandas
-scikit-learn
+# Reference environment: Python 3.12.14. Pin direct and transitive dependencies.
+pandas==2.2.3
+scikit-learn==1.8.0
+numpy==2.3.5
+scipy==1.17.0
+joblib==1.5.3
+threadpoolctl==3.6.0
+python-dateutil==2.9.0.post0
+pytz==2026.4
+tzdata==2026.4
+six==1.17.0

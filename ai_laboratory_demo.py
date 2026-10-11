@@ -6,7 +6,17 @@ This script demonstrates a basic binary classification pipeline.
 It is NOT a clinical decision-support system.
 """
 
+import argparse
+import hashlib
+import json
+import platform
+import warnings
+from importlib.metadata import version
+from pathlib import Path
+
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
+from threadpoolctl import threadpool_limits
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -31,9 +41,11 @@ FEATURES = [
 ]
 
 TARGET = "review_outcome"
+RANDOM_STATE = 42
+DEFAULT_DATA = Path(__file__).resolve().parent / "synthetic_laboratory_ai_data.csv"
 
 
-def load_data(path="synthetic_laboratory_ai_data.csv"):
+def load_data(path=DEFAULT_DATA):
     df = pd.read_csv(path)
     return df
 
@@ -59,14 +71,17 @@ def build_model():
     model = Pipeline(
         steps=[
             ("preprocess", preprocessor),
-            ("classifier", LogisticRegression(max_iter=1000)),
+            ("classifier", LogisticRegression(
+                solver="lbfgs", C=1.0, tol=1e-4,
+                max_iter=1000, random_state=RANDOM_STATE,
+            )),
         ]
     )
     return model
 
 
 def evaluate_model(y_true, y_pred, y_prob):
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
     sensitivity = tp / (tp + fn) if (tp + fn) else float("nan")
@@ -84,9 +99,21 @@ def evaluate_model(y_true, y_pred, y_prob):
 
     print("\nClassification report")
     print(classification_report(y_true, y_pred, digits=3))
+    return {
+        "roc_auc": float(auc),
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+        "confusion_matrix": cm.tolist(),
+        "classification_report": classification_report(
+            y_true, y_pred, output_dict=True,
+        ),
+    }
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, help="Write a reproducibility JSON record")
+    args = parser.parse_args()
     df = load_data()
 
     X = df[FEATURES]
@@ -96,17 +123,53 @@ def main():
         X,
         y,
         test_size=0.30,
-        random_state=42,
+        random_state=RANDOM_STATE,
         stratify=y,
     )
 
     model = build_model()
-    model.fit(X_train, y_train)
+    # Limit numerical-library threads; do not silently accept an unconverged fit.
+    with threadpool_limits(limits=1), warnings.catch_warnings():
+        warnings.simplefilter("error", ConvergenceWarning)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
 
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
-
-    evaluate_model(y_test, y_pred, y_prob)
+    metrics = evaluate_model(y_test, y_pred, y_prob)
+    if args.output is not None:
+        classifier = model.named_steps["classifier"]
+        record = {
+            "dataset_sha256": hashlib.sha256(DEFAULT_DATA.read_bytes()).hexdigest(),
+            "environment": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "packages": {name: version(name) for name in (
+                    "pandas", "scikit-learn", "numpy", "scipy", "joblib",
+                    "threadpoolctl", "python-dateutil", "pytz", "tzdata", "six",
+                )},
+            },
+            "configuration": {
+                "random_state": RANDOM_STATE, "test_size": 0.30,
+                "stratified": True, "features": FEATURES, "target": TARGET,
+                "numerical_threads": 1,
+                "classifier": classifier.get_params(),
+            },
+            "train_sample_ids": df.loc[X_train.index, "sample_id"].tolist(),
+            "test_sample_ids": df.loc[X_test.index, "sample_id"].tolist(),
+            "y_true": y_test.tolist(), "y_pred": y_pred.tolist(),
+            "y_probability": y_prob.tolist(),
+            "classes": classifier.classes_.tolist(),
+            "transformed_features": model.named_steps["preprocess"].get_feature_names_out().tolist(),
+            "coefficients": classifier.coef_.tolist(),
+            "intercept": classifier.intercept_.tolist(),
+            "iterations": classifier.n_iter_.tolist(),
+            "metrics": metrics,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
 
     print("\nImportant:")
     print(
